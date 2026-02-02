@@ -396,3 +396,178 @@ class LCESTB(nn.Module):
         x = self.lce_block(x)
 
         return x
+
+class FrequencyEnhancedBlock(nn.Module):
+    """
+    Frequency-Enhanced Block using simplified frequency modeling.
+
+    From paper:
+    - Applies DCT to extract frequency features
+    - Uses FC layer to compute frequency attention weights
+
+    Simplified implementation:
+    - Uses learnable frequency filters instead of explicit DCT
+    - Applies channel-wise frequency attention
+
+    Args:
+        dim: Channel dimension
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+        # Global pooling to get frequency statistics
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # FC layer to compute frequency attention weights
+        # From paper: "a simple fully connected (FC) layer is used to
+        # compute the frequency domain attention weights"
+        self.fc = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim // 4, dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, C, H, W) - frequency-enhanced features
+        """
+        B, C, H, W = x.shape
+
+        # Global pooling (approximates frequency spectrum statistics)
+        freq_stats = self.pool(x).view(B, C)  # (B, C)
+
+        # Compute frequency attention weights
+        freq_weights = self.fc(freq_stats).view(B, C, 1, 1)  # (B, C, 1, 1)
+
+        # Apply frequency attention
+        out = x * freq_weights
+
+        return out
+
+class GlobalTransformerBlock(nn.Module):
+    """
+    Standard Transformer block with global attention.
+
+    Used at the bottleneck where spatial dimensions are small,
+    so global attention is computationally feasible.
+
+    From paper Eq. (4):
+    X̂ˡ = MSA(LN(Xˡ⁻¹)) + Xˡ⁻¹
+    Xˡ = MLP(LN(X̂ˡ)) + X̂ˡ
+
+    Args:
+        dim: Channel dimension
+        num_heads: Number of attention heads
+    """
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        # Normalization
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        # QKV projection
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+        # MLP
+        mlp_hidden_dim = int(dim * 4)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, dim)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        shortcut = x
+
+        # Reshape to (B, N, C) where N = H*W
+        x = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        N = x.shape[1]
+
+        # Multi-head self-attention
+        x = self.norm1(x)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, N, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+
+        # Reshape back and residual
+        x = x.transpose(1, 2).view(B, C, H, W)
+        x = shortcut + x
+
+        # MLP block
+        shortcut = x
+        x = x.flatten(2).transpose(1, 2)  # (B, N, C)
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x.transpose(1, 2).view(B, C, H, W)
+
+        # Residual
+        x = shortcut + x
+
+        return x
+
+class FETB(nn.Module):
+    """
+    Frequency-Enhanced Transformer Block.
+
+    Combines:
+    1. Global Transformer Block (capture global context)
+    2. Frequency-Enhanced Block (frequency domain modeling)
+
+    Used at the bottleneck of the encoder/decoder.
+
+    Args:
+        dim: Channel dimension
+        num_heads: Number of attention heads
+        num_blocks: Number of Transformer blocks (default 2)
+    """
+    def __init__(self, dim, num_heads=4, num_blocks=2):
+        super().__init__()
+
+        # Multiple Transformer blocks
+        self.blocks = nn.ModuleList([
+            GlobalTransformerBlock(dim, num_heads)
+            for _ in range(num_blocks)
+        ])
+
+        # Frequency enhancement
+        self.freq_enhance = FrequencyEnhancedBlock(dim)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            (B, C, H, W)
+        """
+        # Apply Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        # Apply frequency enhancement
+        x = self.freq_enhance(x)
+
+        return x

@@ -1,8 +1,47 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+import os
 
 from utils.dataset import RoWSFormerDataset
+from utils.metrics import compute_psnr, compute_bit_accuracy
 from models.encoder import Encoder
+from models.decoder import Decoder
+from models.discriminator import WatermarkLoss
+from models.layers.noise import NoiseLayer
+from train import train
+
+
+def save_model(encoder, decoder, optimizer, epoch, path='checkpoints/model.pth'):
+    """Save model checkpoint."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'encoder_state_dict': encoder.state_dict(),
+        'decoder_state_dict': decoder.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, path)
+    print(f"✓ Model saved to {path}")
+
+
+def load_model(encoder, decoder, optimizer=None, path='checkpoints/model.pth'):
+    """Load model checkpoint."""
+    if not os.path.exists(path):
+        print(f"No checkpoint found at {path}")
+        return 0
+    
+    checkpoint = torch.load(path)
+    encoder.load_state_dict(checkpoint['encoder_state_dict'])
+    decoder.load_state_dict(checkpoint['decoder_state_dict'])
+    
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    epoch = checkpoint.get('epoch', 0)
+    print(f"✓ Model loaded from {path} (epoch {epoch})")
+    return epoch
 
 
 def main():
@@ -10,62 +49,104 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # 1. Define paths to training and validation high-resolution image directories
-    train_hr_dir = './data/DIV2K_train_HR/DIV2K_train_HR/'
-    val_hr_dir = './data/DIV2K_valid_HR/DIV2K_valid_HR/'
+    # ============ Configuration ============
+    # ============ Configuration ============
+    batch_size = 4
+    num_epochs = 50             # More epochs
+    learning_rate = 2e-4
+    base_dim = 64               # Larger model
+    num_stages = 3
+    watermark_length = 64
+    checkpoint_path = 'checkpoints/model.pth'
     
-    # 2. Create dataset
-    train_dataset = RoWSFormerDataset(train_hr_dir)
-    valid_dataset = RoWSFormerDataset(val_hr_dir)
+    # ============ Data ============
+    train_hr_dir = './data/DIV2K_train_HR/DIV2K_train_HR/'
+    
+    train_dataset = RoWSFormerDataset(train_hr_dir, img_size=128, bit_length=watermark_length)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    
+    print(f"Dataset size: {len(train_dataset)} images")
 
-    # 3. Create DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
-
-    # 4. Initialize Encoder
+    # ============ Models ============
     encoder = Encoder(
         in_channels=3,
-        base_dim=64,
-        num_stages=3,
-        watermark_length=64
+        base_dim=base_dim,
+        num_stages=num_stages,
+        watermark_length=watermark_length
     ).to(device)
     
-    print(f"Encoder initialized with {sum(p.numel() for p in encoder.parameters()):,} parameters")
-
-    # 5. Process one batch for testing
-    for batch_idx, batch in enumerate(train_loader):
-        images, watermarks = batch
+    decoder = Decoder(
+        in_channels=3,
+        base_dim=base_dim,
+        num_stages=num_stages,
+        watermark_length=watermark_length
+    ).to(device)
+    
+    noise_layer = NoiseLayer()
+    
+    # ============ Loss & Optimizer ============
+    criterion = WatermarkLoss(lambda_1=2.0, lambda_2=10.0, lambda_3=0.1)
+    
+    # Combine encoder and decoder parameters
+    params = list(encoder.parameters()) + list(decoder.parameters())
+    optimizer = torch.optim.AdamW(params, lr=learning_rate, weight_decay=1e-4)
+    
+    # Print model info
+    encoder_params = sum(p.numel() for p in encoder.parameters())
+    decoder_params = sum(p.numel() for p in decoder.parameters())
+    print(f"Encoder parameters: {encoder_params:,}")
+    print(f"Decoder parameters: {decoder_params:,}")
+    print(f"Total parameters: {encoder_params + decoder_params:,}")
+    
+    # ============ Training ============
+    print("\n" + "="*50)
+    print("Starting Training...")
+    print("="*50)
+    
+    train(encoder, decoder, noise_layer, train_loader,
+          criterion, optimizer, device, num_epochs=num_epochs)
+    
+    # ============ Save Model ============
+    save_model(encoder, decoder, optimizer, num_epochs, checkpoint_path)
+    
+    # ============ Test & Visualize ============
+    print("\n" + "="*50)
+    print("Testing on sample images...")
+    print("="*50)
+    
+    encoder.eval()
+    decoder.eval()
+    
+    with torch.no_grad():
+        # Get a batch
+        images, watermarks = next(iter(train_loader))
         images = images.to(device)
         watermarks = watermarks.to(device)
         
-        print(f"\n=== Processing Batch {batch_idx + 1} ===")
-        print(f"Cover image shape: {images.shape}")
-        print(f"Watermark shape: {watermarks.shape}")
-        print(f"Cover image range: [{images.min().item():.3f}, {images.max().item():.3f}]")
+        # Encode
+        watermarked = encoder(images, watermarks)
         
-        # Encode watermark into image
-        with torch.no_grad():  # No gradients needed for inference
-            watermarked_images = encoder(images, watermarks)
+        # Decode (no attack)
+        extracted = decoder(watermarked)
         
-        print(f"Watermarked image shape: {watermarked_images.shape}")
-        print(f"Watermarked image range: [{watermarked_images.min().item():.3f}, {watermarked_images.max().item():.3f}]")
+        # Compute metrics
+        psnr = compute_psnr(images, watermarked)
+        accuracy = compute_bit_accuracy(watermarks, extracted)
         
-        # Calculate perturbation statistics
-        perturbation = watermarked_images - images
-        print(f"\nPerturbation statistics:")
-        print(f"  Mean: {perturbation.mean().item():.6f}")
-        print(f"  Std: {perturbation.std().item():.6f}")
-        print(f"  Min: {perturbation.min().item():.6f}")
-        print(f"  Max: {perturbation.max().item():.6f}")
+        print(f"\nResults (no attack):")
+        print(f"  PSNR: {psnr:.2f} dB")
+        print(f"  Bit Accuracy: {accuracy:.2f}%")
         
-        # Calculate PSNR (Peak Signal-to-Noise Ratio)
-        mse = torch.mean((watermarked_images - images) ** 2)
-        psnr = 10 * torch.log10(1.0 / mse)
-        print(f"  PSNR: {psnr.item():.2f} dB")
+        # Test with attack
+        attacked = noise_layer(watermarked, images, attack_type='gaussian_noise')
+        extracted_attacked = decoder(attacked)
+        accuracy_attacked = compute_bit_accuracy(watermarks, extracted_attacked)
         
-        break  # Process only one batch for testing
-
-    print("\n✓ Encoding test completed successfully!")
+        print(f"\nResults (Gaussian noise attack):")
+        print(f"  Bit Accuracy: {accuracy_attacked:.2f}%")
+        
+    
+    print("\n✓ Done!")
 
 
 if __name__ == "__main__":
